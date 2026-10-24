@@ -286,7 +286,7 @@ void dm_ctrl_start(const dm_ctrl_ops *ops) {
     if (ax && *ax && !dm_axmap_parse(ax, &g_axmap)) LOG("DM_MOTION_AXES=%s is not three of x, y, z with optional signs (such as x,-y,-z); using the default", ax);
     const char *be = getenv("DM_PAD_BACKEND"); if (!be || !*be) be = "auto";
     int want_sdl = !strcmp(be, "sdl3");   // auto is GameController: it drives a DualSense's two actuators with layered bands, which SDL3's two-motor rumble cannot
-    if (!strcmp(be, "sdl3") && !dm_sdl3_available()) LOG("DM_PAD_BACKEND=sdl3, but this build has no SDL3 (see docs/development.md, "Controllers"); using GameController");
+    if (!strcmp(be, "sdl3") && !dm_sdl3_available()) LOG("DM_PAD_BACKEND=sdl3, but this build has no SDL3 (see docs/development.md, Controllers); using GameController");
     else if (strcmp(be, "auto") && strcmp(be, "gc") && strcmp(be, "sdl3")) LOG("DM_PAD_BACKEND=%s is not auto, gc or sdl3; using auto", be);
     LOG("controllers: face keys %s layout, motion %s, rumble %s", g_face == DM_FACE_XBOX ? "Xbox" : "Nintendo", g_motion_on ? "on" : "off", g_rumble_on ? "on" : "off");
     if (want_sdl && dm_sdl3_start(ops)) { LOG("controllers: SDL3 backend"); return; }
