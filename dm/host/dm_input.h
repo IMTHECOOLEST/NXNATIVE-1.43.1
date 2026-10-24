@@ -17,6 +17,20 @@ uint64_t dm_input_samples(void);   // Cumulative number of times the game has sa
 // ORed bitwise and a stick uses the controller's value if it is non-zero. All 0 when no controller is connected, so values are bit-for-bit the same as before
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
 
+// Motion of a physical controller (the iOS front end, DmController.m): one sample in the Switch controller frame, in which a controller lying flat, face up, reads acceleration (0, 0, -1) G
+// (hle_hid.c, six-axis section): acceleration in G, angular velocity in rad/s. Samples may arrive at any rate and from any thread. The host keeps the newest, integrates the angular velocity into the
+// six-axis angle and direction itself, and reports the sensor as the synthetic one (at rest, or shaken) again 0.5 s after the last sample or after dm_pad_motion_clear.
+// Without calls (the Mac host, a phone with no controller) nothing changes: the sensor lies flat and shakes only while DM_BTN_SHAKE is held.
+void dm_pad_motion_set(const float acc_g[3], const float gyro_rps[3]);
+void dm_pad_motion_clear(void);
+
+// Rumble of a physical controller. While a sink is attached the host reports vibration devices (two: left and right, linear resonant actuators) and IsVibrationPermitted; with none (the default)
+// it reports no vibration device, as before. device 0 = left, 1 = right. Each vibration value holds two bands, an amplitude 0..1 and a frequency 40..1252 Hz (both clamped by the host);
+// the sink is called from the game's threads (with the host's lock held: it must be quick and must not call back), only when a device's clamped value changed, and with zeros (a silent band's frequency is 0)
+// when the game silences a device. Every device starts silent: attaching or detaching resets what the host remembers, so a value after it reaches the sink unless it is silence
+typedef void (*dm_rumble_fn)(int device, float amp_lo, float freq_lo, float amp_hi, float freq_hi);
+void dm_rumble_attach(dm_rumble_fn fn);   // NULL detaches
+
 // Optional diagnostic DM_HID_RECEIPT_LOG=<writable JSONL path>: received samples of real GetNpadState returns.
 // Fields read_start_ns/time_ns use the same host now_ns(); the front-end publish window must use the same helper, and a read interval that spans a publish must not be force-matched.
 // State changes + at most one activity witness per second, limit_reached after 1024 entries; no file is written when the environment variable is not set.

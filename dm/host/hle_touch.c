@@ -9,10 +9,15 @@
 #include "dm.h"
 #include "front.h"
 #include <pthread.h>
+#include <stdatomic.h>
+#include <math.h>
 enum { F_EMPTY, F_DOWN, F_LIFTED };
 static struct { int st, reported, again; float x, y, ax, ay; } g_f[16];   // again/ax/ay: the same id was pressed again before End went out (the next read reports End first, then the new Start)
 static pthread_mutex_t g_tl = PTHREAD_MUTEX_INITIALIZER;
 static int64_t g_tsamp; static uint64_t g_tlast_ns;
+static _Atomic double g_pic_aspect = 16.0 / 9.0;   // the presented picture's aspect, see front.h
+void dm_picture_aspect_set(double a) { if (isfinite(a) && a > 0.2 && a < 5.0) atomic_store(&g_pic_aspect, a); }
+double dm_picture_aspect(void) { return atomic_load(&g_pic_aspect); }
 
 void dm_touch_set(const dm_touch *t, int n) {
     pthread_mutex_lock(&g_tl);

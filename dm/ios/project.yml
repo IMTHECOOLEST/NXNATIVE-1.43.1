@@ -21,6 +21,8 @@ targets:
       - path: Gen/src         # Source files from the compile commands of dm/host/Makefile (linked in by tools/gen_build.py)
       - path: Gen/main/main.c
         compilerFlags: "-Dmain=dm_main"
+    dependencies:
+      - sdk: CoreHaptics.framework   # DualSense / Xbox HD rumble (DmController.m); GameController, CoreMotion and the rest come from the host's link line or autolinking
     info:
       path: Sources/Info.plist
       properties:
@@ -61,7 +63,8 @@ targets:
       TARGETED_DEVICE_FAMILY: "1,2"
       ENABLE_BITCODE: NO
       GCC_C_LANGUAGE_STANDARD: gnu11
-      OTHER_CFLAGS: $(inherited) -mcpu=apple-a18   # The host assembly contains LSE atomic instructions, which the default baseline does not accept
+      OTHER_CFLAGS: $(inherited) -mcpu=apple-a18 $(DM_SDL3_DEFS)   # The host assembly contains LSE atomic instructions, which the default baseline does not accept. DM_SDL3_DEFS: -DDM_HAVE_SDL3=1 when build_ipa.sh was given SDL3_PREFIX, else empty
+      HEADER_SEARCH_PATHS: $(inherited) $(DM_SDL3_INC)   # the SDL3 headers, likewise empty without SDL3_PREFIX
       CLANG_ENABLE_OBJC_ARC: YES
       DEBUG_INFORMATION_FORMAT: dwarf
       GCC_WARN_INHIBIT_ALL_WARNINGS: YES

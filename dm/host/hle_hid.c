@@ -1,7 +1,9 @@
 // nn::hid (controller): on the real device shared memory is read through the hid service; the host takes the current state written by the front end (Mac keyboard / controller, iOS virtual gamepad / controller).
 // Generic, game-independent version: one standard controller. DM_OPMODE=0 (handheld) → handheld controller (Npad id 0x20); otherwise → 1P full-key controller (id 0).
-// Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
-// Vibration, mouse, keyboard: not provided by the host (device count 0 / not connected); the controller applet reports "1 player, current controller selected".
+// Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, shaken side to side while the front end holds DM_BTN_SHAKE, or the motion of a physical controller that
+// reports it (dm_pad_motion_set; see the six-axis section below).
+// Vibration: two devices (left, right) while a physical controller's rumble is attached (dm_rumble_attach), none otherwise. Mouse, keyboard: not provided by the host (device count 0 / not connected);
+// the controller applet reports "1 player, current controller selected".
 #include "hle.h"
 #include "dm_input.h"
 #include "front.h"
@@ -172,10 +174,67 @@ enum { SIX_PERIOD_NS = 5000000 };
 #define SHAKE_G 3.0
 #define SHAKE_REV 1.5
 static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < atomic_load(&g_shake_end); }
-static void six_sample(SixAxisState *s, int64_t samp) {
+// A physical controller's own motion (dm_pad_motion_set, the front end): the newest sample, in the Switch frame (flat, face up: acceleration (0, 0, -1) G). The angular velocity comes in rad/s and the
+// state wants revolutions: the angle is its integral per axis; the direction (the controller's three axes written in the frame the sensor started in, one axis per row, as the shaking one below)
+// turns by the same angular velocity: each axis is rotated about the world-frame angular velocity (the device-frame rates carried along the current axes) by its length times dt, exactly (Rodrigues), then
+// the rows are made orthonormal again. A gap of more than MOT_STALE_NS (or the first sample) starts again from the identity; dt is capped at 0.1 s
+typedef struct { int ok; float acc[3], gyro[3], angle[3], dir[9]; } mot_t;   // gyro in revolutions / s
+enum { MOT_STALE_NS = 500000000 };
+static struct { pthread_mutex_t mu; int valid; uint64_t last_ns; mot_t m; } g_mot = {.mu = PTHREAD_MUTEX_INITIALIZER};
+static void dir_identity(float d[9]) { memset(d, 0, 9 * sizeof *d); d[0] = d[4] = d[8] = 1; }
+static double dot3(const double a[3], const double b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+static void cross3(const double a[3], const double b[3], double o[3]) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
+static int unit3(double v[3]) { double n = sqrt(dot3(v, v)); if (!(n > 1e-12)) return 0; v[0] /= n; v[1] /= n; v[2] /= n; return 1; }
+static void dir_turn(float dir[9], const double w_rad[3], double dt) {
+    double a[3][3]; for (int i = 0; i < 3; i++) for (int k = 0; k < 3; k++) a[i][k] = dir[3 * i + k];
+    double ww[3] = {0, 0, 0};   // the angular velocity in the world frame
+    for (int j = 0; j < 3; j++) for (int k = 0; k < 3; k++) ww[k] += w_rad[j] * a[j][k];
+    double mag = sqrt(dot3(ww, ww)), th = mag * dt;
+    if (th > 1e-12) {
+        double n[3] = {ww[0] / mag, ww[1] / mag, ww[2] / mag}, c = cos(th), sn = sin(th);
+        for (int i = 0; i < 3; i++) {
+            double nx[3], nd = dot3(n, a[i]); cross3(n, a[i], nx);
+            for (int k = 0; k < 3; k++) a[i][k] = a[i][k] * c + nx[k] * sn + n[k] * nd * (1 - c);
+        }
+    }
+    if (!unit3(a[0])) { a[0][0] = 1; a[0][1] = a[0][2] = 0; }   // Gram-Schmidt: row 0 stays, row 1 loses its part along it, row 2 is their cross product
+    double d01 = dot3(a[0], a[1]); for (int k = 0; k < 3; k++) a[1][k] -= d01 * a[0][k];
+    if (!unit3(a[1])) { double t[3] = {0, 1, 0}; if (fabs(a[0][1]) > 0.9) { t[1] = 0; t[2] = 1; } double d = dot3(a[0], t); for (int k = 0; k < 3; k++) a[1][k] = t[k] - d * a[0][k]; unit3(a[1]); }
+    cross3(a[0], a[1], a[2]);
+    for (int i = 0; i < 3; i++) for (int k = 0; k < 3; k++) dir[3 * i + k] = (float)a[i][k];
+}
+static float finite_or_0(float v) { return isfinite(v) ? v : 0.f; }
+void dm_pad_motion_set(const float acc_g[3], const float gyro_rps[3]) {
+    uint64_t t = now_ns(); double w[3];
+    for (int i = 0; i < 3; i++) w[i] = finite_or_0(gyro_rps[i]);
+    pthread_mutex_lock(&g_mot.mu);
+    double dt = 0;
+    if (!g_mot.valid || t - g_mot.last_ns > MOT_STALE_NS) { memset(&g_mot.m, 0, sizeof g_mot.m); dir_identity(g_mot.m.dir); }
+    else { dt = (double)(t - g_mot.last_ns) / 1e9; if (dt > 0.1) dt = 0.1; }
+    for (int i = 0; i < 3; i++) {
+        g_mot.m.acc[i] = finite_or_0(acc_g[i]);
+        g_mot.m.gyro[i] = (float)(w[i] / (2 * M_PI));
+        g_mot.m.angle[i] += (float)(w[i] / (2 * M_PI) * dt);
+    }
+    if (dt > 0) dir_turn(g_mot.m.dir, w, dt);
+    g_mot.m.ok = 1; g_mot.valid = 1; g_mot.last_ns = t;
+    pthread_mutex_unlock(&g_mot.mu);
+}
+void dm_pad_motion_clear(void) { pthread_mutex_lock(&g_mot.mu); g_mot.valid = 0; pthread_mutex_unlock(&g_mot.mu); }
+static void mot_get(mot_t *o) {
+    pthread_mutex_lock(&g_mot.mu);
+    if (g_mot.valid && now_ns() - g_mot.last_ns <= MOT_STALE_NS) *o = g_mot.m; else o->ok = 0;
+    pthread_mutex_unlock(&g_mot.mu);
+}
+static void six_sample(SixAxisState *s, int64_t samp, const mot_t *mot) {
     memset(s, 0, sizeof *s);
     uint64_t t = (uint64_t)samp * SIX_PERIOD_NS;
     s->delta_ns = SIX_PERIOD_NS; s->sampling = samp; s->attributes = 1;   // IsConnected
+    if (mot->ok) {   // the controller's own motion; a phone shake (DM_BTN_SHAKE) still adds its swing on top
+        memcpy(s->acc, mot->acc, sizeof s->acc); memcpy(s->gyro, mot->gyro, sizeof s->gyro); memcpy(s->angle, mot->angle, sizeof s->angle); memcpy(s->dir, mot->dir, sizeof s->dir);
+        if (shaking(t)) { double ph = 2 * M_PI * SHAKE_HZ * (double)(t - atomic_load(&g_shake_t0)) / 1e9; s->acc[0] += (float)(SHAKE_G * sin(ph)); s->gyro[2] += (float)(SHAKE_REV * sin(ph)); }
+        return;
+    }
     s->acc[2] = -1;
     double yaw = 0;
     if (shaking(t)) {
@@ -194,7 +253,8 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     if (n <= 0) return 0;
     if (!six_connected(h)) { memset(out, 0, sizeof *out * (size_t)n); return 0; }
     int64_t samp = (int64_t)(guest_ns() / SIX_PERIOD_NS);
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i);
+    mot_t mot; mot_get(&mot);   // one reading for every entry: the controller keeps no history here
+    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, &mot);
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
@@ -206,15 +266,62 @@ HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", "six-axis sensor states: every requested entry, newest first",
           int, h_hid_SixStates, SixAxisState *out, int n, const uint32_t *h) { return six_states(out, n, *h); }
-// Vibration: no devices
-HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "vibration permission; not supported by the host", unsigned, h_hid_VibPermit, void) { return 0; }
-HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "vibration devices: 0",
-          int, h_hid_VibHandles, void *h, int n, const uint32_t *id, uint32_t style) { (void)h; (void)n; (void)id; (void)style; return 0; }
-HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "vibration; not supported by the host", void, h_hid_InitVib, const void *h) { (void)h; }
-HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "vibration; not supported by the host", void, h_hid_SendVib, const void *h, const void *v) { (void)h; (void)v; }
+// Vibration. While a physical controller's rumble is attached (dm_rumble_attach, dm_input.h) the host has two vibration devices on the connected controller, left and right, both linear resonant
+// actuators; without one it has none, as before. VibrationDeviceHandle is a u32 built as the six-axis handle is (byte 0 the style's bit number, byte 1 the npad id, byte 2 the device: 0 left, 1 right);
+// VibrationValue is four floats: amplitude low, frequency low, amplitude high, frequency high. Values are clamped (amplitude 0..1, frequency 40..1252 Hz) and a band with no amplitude carries frequency 0.
+// What each device last got is remembered (silence at first, and after attach / detach): a value equal to it does not reach the sink, which is called with the lock held so two threads cannot reorder it
+typedef struct { float v[4]; } vib_t;
+static _Atomic(dm_rumble_fn) g_rumble;
+static pthread_mutex_t g_vmu = PTHREAD_MUTEX_INITIALIZER;
+static vib_t g_vib[2];
+void dm_rumble_attach(dm_rumble_fn fn) {
+    pthread_mutex_lock(&g_vmu); memset(g_vib, 0, sizeof g_vib); atomic_store(&g_rumble, fn); pthread_mutex_unlock(&g_vmu);
+}
+static float vib_amp(float a) { return a > 0.f ? (a < 1.f ? a : 1.f) : 0.f; }   // NaN and negatives → 0
+static float vib_freq(float f) { return f > 40.f ? (f < 1252.f ? f : 1252.f) : 40.f; }   // NaN and below 40 → 40
+static vib_t vib_clean(const float *raw) {
+    vib_t o; float al = vib_amp(raw[0]), ah = vib_amp(raw[2]);
+    o.v[0] = al; o.v[1] = al > 0.f ? vib_freq(raw[1]) : 0.f; o.v[2] = ah; o.v[3] = ah > 0.f ? vib_freq(raw[3]) : 0.f;
+    return o;
+}
+static int vib_dev(uint32_t h) {   // the device a handle names, -1 when it is not on the connected controller or no rumble is attached
+    if (!atomic_load(&g_rumble)) return -1;
+    uint32_t id = connected_id(); unsigned bit = h & 0xff;
+    if ((h >> 8 & 0xff) != id || bit >= 32 || !(style_of(id) >> bit & 1)) return -1;
+    unsigned d = h >> 16 & 0xff;
+    return d < 2 ? (int)d : -1;
+}
+static void vib_send(uint32_t h, const float *raw) {
+    int d = vib_dev(h); if (d < 0) return;
+    vib_t v = vib_clean(raw);
+    pthread_mutex_lock(&g_vmu);
+    dm_rumble_fn f = atomic_load(&g_rumble);
+    if (f && memcmp(&v, &g_vib[d], sizeof v)) { g_vib[d] = v; f(d, v.v[0], v.v[1], v.v[2], v.v[3]); }
+    pthread_mutex_unlock(&g_vmu);
+}
+HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "vibration permission; granted while a physical controller's rumble is attached", unsigned, h_hid_VibPermit, void) { return atomic_load(&g_rumble) != NULL; }
+HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "vibration devices: left and right of the connected controller while rumble is attached, else 0",
+          int, h_hid_VibHandles, uint32_t *h, int n, const uint32_t *id, uint32_t style) {
+    if (!atomic_load(&g_rumble) || n <= 0) return 0;
+    uint32_t have = style_of(*id) & style; if (!have) return 0;   // the connected controller's style, if the game asked for it
+    int k = have & (STYLE_JOYLEFT | STYLE_JOYRIGHT) ? 1 : 2; if (k > n) k = n;
+    for (int i = 0; i < k; i++) h[i] = (uint32_t)__builtin_ctz(have) | (*id & 0xff) << 8 | (uint32_t)i << 16;
+    return k;
+}
+HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "vibration device initialization; nothing to set up on the host", void, h_hid_InitVib, const void *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "vibration value to the attached controller's rumble", void, h_hid_SendVib, const void *h, const void *v) {
+    uint32_t hh; memcpy(&hh, h, 4); float f[4]; memcpy(f, v, 16); vib_send(hh, f);
+}
 // Values queued by the vibration graph (VibrationNode::Update) reach it from the sdk's internal FlushEnqueuedVibrationValues through the PLT, into the hid service proxy (sm abort). Metroid Dread
-// sets handles on its VibrationTargets even when the host reports 0 devices, so values get queued; return success and the flush clears its count as usual
-HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", "vibration (batch, used by the vibration-pattern flush); not supported by the host", Result, h_hid_SendVibs, const void *h, const void *v, int n) { (void)h; (void)v; (void)n; return 0; }
+// sets handles on its VibrationTargets even when the host reports 0 devices, so values get queued; return success and the flush clears its count as usual. With rumble attached the values go to the sink
+HLE_FORCE("_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", "vibration (batch, used by the vibration-pattern flush); to the attached controller's rumble", Result, h_hid_SendVibs, const void *h, const void *v, int n) {
+    for (int i = 0; i < n; i++) { uint32_t hh; memcpy(&hh, (const uint8_t *)h + 4 * i, 4); float f[4]; memcpy(f, (const uint8_t *)v + 16 * i, 16); vib_send(hh, f); }
+    return 0;
+}
+HLE_FORCE("_ZN2nn3hid19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", "vibration (public batch form); to the attached controller's rumble", Result, h_hid_SendVibsPub, const void *h, const void *v, int n) {
+    for (int i = 0; i < n; i++) { uint32_t hh; memcpy(&hh, (const uint8_t *)h + 4 * i, 4); float f[4]; memcpy(f, (const uint8_t *)v + 16 * i, 16); vib_send(hh, f); }
+    return 0;
+}
 // Mouse / keyboard: not connected
 HLE_FORCE("_ZN2nn3hid15InitializeMouseEv", "mouse; not provided by the host", void, h_hid_InitMouse, void) {}
 HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", "mouse states: 0 entries", int, h_hid_MouseStates, void *out, int n) { (void)out; (void)n; return 0; }
@@ -286,7 +393,12 @@ HLE_FORCE("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", "gesture states:
 // Six-axis details: the current state, at rest unless shaking, fusion off
 HLE_FORCE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor; always sampling on the host", void, h_hid_SixStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor current state", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_states(s, 1, *h); }
-HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless shaking", unsigned, h_hid_SixRest, const uint32_t *h) { (void)h; return !shaking(guest_ns()); }
+// At rest: not shaken and, for a controller with motion, turning slower than 0.02 revolutions / s (about 7 degrees / s)
+HLE_FORCE("_ZN2nn3hid21IsSixAxisSensorAtRestERKNS0_19SixAxisSensorHandleE", "six-axis sensor at rest: yes unless shaking or turning", unsigned, h_hid_SixRest, const uint32_t *h) {
+    (void)h; if (shaking(guest_ns())) return 0;
+    mot_t m; mot_get(&m);
+    return !(m.ok && m.gyro[0] * m.gyro[0] + m.gyro[1] * m.gyro[1] + m.gyro[2] * m.gyro[2] > 0.02f * 0.02f);
+}
 // The console's own six-axis sensor (SevenSixAxisSensor, the body's orientation in handheld mode; The Legend of Zelda: Breath of the Wild): takes a work buffer and is switched through the hid service. The host provides none: switching succeeds, 0 states
 HLE_FORCE("_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm", "console six-axis sensor initialization; not provided by the host", Result, h_hid_SevenInit, void *buf, size_t n) { (void)buf; (void)n; return RES_OK; }
 HLE_FORCE("_ZN2nn3hid26FinalizeSevenSixAxisSensorEv", "console six-axis sensor", Result, h_hid_SevenFini, void) { return RES_OK; }
@@ -312,6 +424,16 @@ HLE_FORCE("_ZN2nn3hid32GetSixAxisSensorFusionParametersEPfS1_RKNS0_19SixAxisSens
 HLE_FORCE("_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleEff", "six-axis sensor fusion parameters; ignored by the host", void, h_hid_FusionSet, const uint32_t *h, float a, float b) { (void)h; (void)a; (void)b; }
 HLE_FORCE("_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters; ignored by the host", void, h_hid_FusionReset, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid41IsFirmwareUpdateAvailableForSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor firmware update: none", unsigned, h_hid_SixFw, const uint32_t *h) { (void)h; return 0; }
-// Vibration device info / actual value: no device, zeroed
-HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "vibration device info: none", void, h_hid_VibInfo, uint32_t *info, const void *h) { (void)h; info[0] = 0; info[1] = 0; }
-HLE_FORCE("_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", "actual vibration value: 0", void, h_hid_VibActual, float *v, const void *h) { (void)h; memset(v, 0, 16); }
+// Vibration device info / actual value: see the vibration section above
+// VibrationDeviceInfo = { type (1 = linear resonant actuator), position (1 = left, 2 = right) }; a handle that is not on the connected controller reads as no device (0, 0)
+HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "vibration device info: a linear resonant actuator, left or right", void, h_hid_VibInfo, uint32_t *info, const void *h) {
+    uint32_t hh; memcpy(&hh, h, 4); int d = vib_dev(hh);
+    info[0] = d >= 0 ? 1 : 0; info[1] = d >= 0 ? (uint32_t)d + 1 : 0;
+}
+// What the device last got (silence for a handle that is not on the connected controller); a silent band shows the default frequency, 160 Hz low and 320 Hz high
+HLE_FORCE("_ZN2nn3hid23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", "actual vibration value: what the device last got", void, h_hid_VibActual, float *v, const void *h) {
+    uint32_t hh; memcpy(&hh, h, 4); int d = vib_dev(hh);
+    vib_t x; memset(&x, 0, sizeof x);
+    if (d >= 0) { pthread_mutex_lock(&g_vmu); x = g_vib[d]; pthread_mutex_unlock(&g_vmu); }
+    v[0] = x.v[0]; v[1] = x.v[1] > 0.f ? x.v[1] : 160.f; v[2] = x.v[2]; v[3] = x.v[3] > 0.f ? x.v[3] : 320.f;
+}

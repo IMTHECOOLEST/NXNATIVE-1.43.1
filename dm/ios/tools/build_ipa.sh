@@ -46,7 +46,17 @@ t "generate Gen/ (host sources, embedded modules, tables)"
 rm -rf Gen && mkdir -p Gen/dm || die "mkdir Gen"
 python3 tools/gen_build.py ../host Gen > Gen/dm.xcconfig || die "gen_build"
 F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"
-echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
+# SDL3 gamepad backend (optional): SDL3_PREFIX=<prefix> (tools/build_sdl3.sh builds one) compiles Sources/DmSDL3Pad.c with SDL3 and links libSDL3.a; DM_PAD_BACKEND=sdl3 in the app's Documents/env.txt then selects it.
+# Without SDL3_PREFIX the three variables stay empty and that file is two stubs. SDL's HIDAPI drivers are not used (DmSDL3Pad.c switches them off), the frameworks are what a static SDL3 on iOS references
+if [ -n "${SDL3_PREFIX:-}" ]; then
+  [ -f "$SDL3_PREFIX/lib/libSDL3.a" ] && [ -f "$SDL3_PREFIX/include/SDL3/SDL.h" ] || die "SDL3_PREFIX=$SDL3_PREFIX has no lib/libSDL3.a and include/SDL3/SDL.h (tools/build_sdl3.sh <SDL3 source> builds them)"
+  S3=$(cd "$SDL3_PREFIX" && pwd)
+  echo "DM_SDL3_INC = \"$S3/include\"" >> Gen/dm.xcconfig
+  echo "DM_SDL3_DEFS = -DDM_HAVE_SDL3=1" >> Gen/dm.xcconfig
+  echo "DM_SDL3_LIBS = -ObjC \"$S3/lib/libSDL3.a\" -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreBluetooth -framework CoreFoundation -framework CoreGraphics -framework CoreHaptics -framework CoreMedia -framework CoreMotion -framework CoreVideo -framework Foundation -framework GameController -framework ImageIO -framework Metal -framework MobileCoreServices -framework QuartzCore -framework UIKit -framework UniformTypeIdentifiers" >> Gen/dm.xcconfig
+  t "SDL3 gamepad backend: $S3"
+fi
+echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F \$(DM_SDL3_LIBS)" >> Gen/dm.xcconfig
 cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv Gen/dm/ || die "copy rewriter tables"
 if [ "$GFXAPI" = vulkan ] || [ "$GFXAPI" = gl ]; then cp "$GD/shader_map.tsv" "$GD/pso_manifest.tsv" Gen/dm/ || die "copy shader tables"   # empty NVN tables: the NVN layer draws nothing
 else cp "$GD/shader_map.tsv" "$GD/pso_manifest.tsv" "$GD/c1_full.tsv" Gen/dm/ || die "copy shader tables"

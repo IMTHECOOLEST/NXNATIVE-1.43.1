@@ -11,6 +11,7 @@
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
+CGFloat dm_pad_unit(CGSize screen);   // DmGamepad.m: the controls' unit for this screen
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
 
@@ -44,6 +45,13 @@ static UILabel *front_ios_fps_label(void);
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
 @end
+// Fit the game to a 1.43:1 viewport inside the whole screen (centred; also DmGamepad.m's touch mapping)
+CGRect dm_game_rect(CGRect b) {
+    static const CGFloat gameAspectRatio = 1.43;
+    CGFloat w = b.size.width, h = b.size.height;
+    if (w / h > gameAspectRatio) w = h * gameAspectRatio; else h = w / gameAspectRatio;
+    return CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+}
 @implementation DmRootVC
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -69,12 +77,9 @@ static UILabel *front_ios_fps_label(void);
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGRect b = self.view.bounds; if (!self.game) return;
-    CGFloat w = b.size.width, h = b.size.height;   // Fit the game to a 1.43:1 viewport inside the whole screen
-    static const CGFloat gameAspectRatio = 1.43;
-    if (w / h > gameAspectRatio) w = h * gameAspectRatio; else h = w / gameAspectRatio;
-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+    self.game.frame = dm_game_rect(b);
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
-        CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+        CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = dm_pad_unit(b.size);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
     }
 }

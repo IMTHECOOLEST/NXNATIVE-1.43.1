@@ -4,3 +4,6 @@
 .iosdd_*/
 .DS_Store
 __pycache__/
+
+# SDL3 for iOS built by dm/ios/tools/build_sdl3.sh (the optional SDL3 gamepad backend)
+dm/third_party/sdl3-ios/
